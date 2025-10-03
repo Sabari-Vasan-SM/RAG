@@ -32,34 +32,24 @@ def extract_text_from_pdf_bytes(pdf_bytes: bytes) -> str:
     return "\n".join(texts)
 
 def preprocess_text(text: str) -> str:
-    """Normalize spaces and lowercase."""
+    """Normalize spaces and remove extra newlines."""
     text = text.replace("\n", " ").replace("\r", " ")
     text = re.sub(r"\s+", " ", text)
     return text.strip()
 
-def guess_name(text: str, filename: str) -> str:
-    """
-    Extract candidate name from first few lines of text.
-    Heuristic:
-    - Skip lines with email, phone, or keywords like 'resume'
-    - Return first line with 2-5 words (likely the name)
-    - Fallback to filename if unknown
-    """
+def guess_name(text: str) -> Optional[str]:
+    """Extract candidate name from first few lines of text."""
     lines = [l.strip() for l in text.splitlines() if l.strip()]
-    for l in lines[:10]:  # check first 10 lines
-        l_lower = l.lower()
-        if "@" in l_lower or "resume" in l_lower or any(c.isdigit() for c in l_lower):
-            continue
-        if 2 <= len(l.split()) <= 5:
+    for l in lines[:5]:
+        if "@" not in l and len(l.split()) <= 4:
             return l
-    # fallback to filename without extension
-    return os.path.splitext(filename)[0]
+    return "Unknown"
 
 # ---------- Embeddings ----------
 
 class LocalEmbeddings:
     def __init__(self):
-        self.model = SentenceTransformer("all-mpnet-base-v2")  # Stronger semantic embeddings
+        self.model = SentenceTransformer("all-mpnet-base-v2")  # stronger semantic embeddings
     def embed_documents(self, texts: List[str]) -> List[List[float]]:
         return self.model.encode(texts).tolist()
     def embed_query(self, text: str) -> List[float]:
@@ -74,7 +64,7 @@ def create_docs_from_pdfs(files: List[Dict[str, Any]]) -> List[Document]:
     for f in files:
         text = extract_text_from_pdf_bytes(f["bytes"])
         text = preprocess_text(text)
-        name = guess_name(text, f["name"])
+        name = guess_name(text)  # use original candidate name detection
         chunks = splitter.split_text(text)
         for i, chunk in enumerate(chunks):
             docs.append(Document(page_content=chunk, metadata={
@@ -162,7 +152,7 @@ if st.button("Search"):
             filtered_indices = [i for i, md in enumerate(vs["metadatas"]) 
                                 if candidate_hint.lower() in md.get("candidate_name", "").lower()]
 
-        # Keyword filtering: only keep chunks that contain at least one keyword
+        # Keyword filtering: only keep chunks containing at least one keyword
         keyword_filtered_indices = []
         for i in filtered_indices:
             text_lower = vs["texts"][i].lower()
@@ -170,8 +160,8 @@ if st.button("Search"):
                 keyword_filtered_indices.append(i)
 
         if not keyword_filtered_indices:
-            st.info("No candidate or chunk contains the keyword. Searching all chunks as fallback.")
-            keyword_filtered_indices = filtered_indices  # fallback to all
+            st.info("No candidate or chunk contains the keyword. Searching all filtered chunks as fallback.")
+            keyword_filtered_indices = filtered_indices  # fallback
 
         # Build temporary FAISS index for filtered docs
         dim = vs["dim"]
