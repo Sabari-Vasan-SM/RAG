@@ -174,33 +174,78 @@ if st.button("Search"):
             filtered_indices = [i for i, md in enumerate(vs["metadatas"]) 
                                 if candidate_hint.lower() in md.get("candidate_name", "").lower()]
 
-        # Keyword filtering: only keep chunks containing at least one keyword
+        # Keyword filtering: mark chunks containing keywords and compute a candidate set
         keyword_filtered_indices = []
+        keyword_match_scores = {}
         for i in filtered_indices:
-            text_lower = vs["texts"][i].lower()
-            if any(kw in text_lower for kw in keywords):
+            text = vs["texts"][i]
+            text_lower = text.lower()
+            matches = sum(1 for kw in keywords if kw in text_lower)
+            # fraction of keywords present
+            frac = matches / max(1, len(keywords))
+            if matches > 0:
                 keyword_filtered_indices.append(i)
+            keyword_match_scores[i] = frac
 
         if not keyword_filtered_indices:
             st.info("No candidate or chunk contains the keyword. Searching all filtered chunks as fallback.")
             keyword_filtered_indices = filtered_indices  # fallback
 
-        # Build temporary FAISS index for filtered docs
+        # Build temporary FAISS inner-product index using stored normalized embeddings
         dim = vs["dim"]
-        temp_index = faiss.IndexFlatL2(dim)
-        embeddings = np.array([vs["index"].reconstruct(i) for i in keyword_filtered_indices]).astype("float32")
-        temp_index.add(embeddings)
+        temp_index = faiss.IndexFlatIP(dim)
+        embeddings = vs.get("embeddings")
+        if embeddings is None or embeddings.size == 0:
+            st.error("Embeddings not available for search. Re-ingest PDFs.")
+            st.stop()
+
+        # select embeddings for the filtered indices
+        sel_embs = embeddings[keyword_filtered_indices].astype("float32")
+        temp_index.add(sel_embs)
         temp_vs = {
             "index": temp_index,
             "texts": [vs["texts"][i] for i in keyword_filtered_indices],
             "metadatas": [vs["metadatas"][i] for i in keyword_filtered_indices],
-            "dim": dim
+            "dim": dim,
+            "orig_indices": keyword_filtered_indices,
+            "keyword_match_scores": keyword_match_scores
         }
 
-        results = query_index(temp_vs, embedder, query, top_k=top_k)
+        raw_results = query_index(temp_vs, embedder, query, top_k=top_k)
+
+        # Combine embedding score (raw_results 'score' is inner-product because we used IndexFlatIP)
+        # with keyword match fraction to create a hybrid score. Weight can be tuned.
+        hybrid_results = []
+        for r in raw_results:
+            # locate original index
+            # find position in temp_vs texts list
+            try:
+                pos = temp_vs["texts"].index(r["text"])
+            except ValueError:
+                pos = None
+            emb_score = r.get("score", 0.0)
+            orig_idx = temp_vs.get("orig_indices")[pos] if pos is not None else None
+            kw_frac = temp_vs.get("keyword_match_scores", {}).get(orig_idx, 0.0)
+            hybrid = 0.75 * emb_score + 0.25 * kw_frac
+            hybrid_results.append({"text": r["text"], "metadata": r["metadata"], "emb_score": emb_score, "kw_frac": kw_frac, "hybrid": hybrid})
+
+        # sort by hybrid score descending
+        hybrid_results.sort(key=lambda x: x["hybrid"], reverse=True)
+
+        results = hybrid_results
 
         st.markdown("### Top Results")
         for r in results:
             md = r["metadata"]
             st.markdown(f"**Candidate: {md['candidate_name']} — Source: {md['source_file']}**")
-            st.write(r["text"][:500] + ("..." if len(r["text"])>500 else ""))
+            score_line = f"Embedding: {r.get('emb_score', 0):.3f} — Keywords: {r.get('kw_frac', 0):.2f} — Hybrid: {r.get('hybrid',0):.3f}"
+            st.caption(score_line)
+
+            # highlight keywords in the text snippet
+            snippet = r["text"]
+            display_snippet = snippet[:1000]
+            # simple highlight by wrapping keyword occurrences in **
+            for kw in sorted(keywords, key=len, reverse=True):
+                if kw.strip():
+                    display_snippet = re.sub(f"(?i)({re.escape(kw)})", r"**\1**", display_snippet)
+            st.write(display_snippet + ("..." if len(snippet) > len(display_snippet) else ""))
