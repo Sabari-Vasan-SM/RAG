@@ -78,20 +78,42 @@ def build_index(docs: List[Document], embedder: LocalEmbeddings):
     """Build FAISS index for document chunks."""
     texts = [d.page_content for d in docs]
     metadatas = [d.metadata for d in docs]
+    # compute embeddings and normalize to unit length so inner-product ~= cosine similarity
     embeddings = np.array(embedder.embed_documents(texts)).astype("float32")
+    # handle empty case
+    if embeddings.size == 0:
+        dim = 0
+        index = faiss.IndexFlatIP(0)
+        vs = {"index": index, "texts": texts, "metadatas": metadatas, "dim": dim, "embeddings": embeddings}
+        return vs
+
+    norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    embeddings = embeddings / norms
     dim = embeddings.shape[1]
-    index = faiss.IndexFlatL2(dim)
+
+    # use inner-product index (works with normalized vectors as cosine similarity)
+    index = faiss.IndexFlatIP(dim)
     index.add(embeddings)
-    vs = {"index": index, "texts": texts, "metadatas": metadatas, "dim": dim}
+
+    # store embeddings array so we can slice/filter without relying on index.reconstruct
+    vs = {"index": index, "texts": texts, "metadatas": metadatas, "dim": dim, "embeddings": embeddings}
     return vs
 
 def query_index(vs, embedder: LocalEmbeddings, query: str, top_k=5):
     """Query FAISS index and return top-k chunks."""
+    # return embedding similarity scores as well
     q_emb = np.array(embedder.embed_query(query)).astype("float32")
+    # normalize query embedding to unit length to match index
+    q_norm = np.linalg.norm(q_emb)
+    if q_norm == 0:
+        q_norm = 1.0
+    q_emb = (q_emb / q_norm).astype("float32")
+
     D, I = vs["index"].search(np.array([q_emb]), top_k)
     results = []
-    for i in I[0]:
-        results.append({"text": vs["texts"][i], "metadata": vs["metadatas"][i]})
+    for score, i in zip(D[0], I[0]):
+        results.append({"text": vs["texts"][i], "metadata": vs["metadatas"][i], "score": float(score)})
     return results
 
 # ---------- Streamlit UI ----------
