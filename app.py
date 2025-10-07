@@ -39,12 +39,40 @@ def preprocess_text(text: str) -> str:
     return text.strip()
 
 def guess_name(text: str) -> Optional[str]:
-    """Extract candidate name from first few lines of text."""
+    """Try to extract a candidate name from the text.
+
+    Strategies (in order):
+    - Look for lines like 'Name: John Doe' or 'Candidate: John Doe'
+    - Use the first short line (<=4 words) without emails
+    - Look for 1-3 consecutive capitalized words (John A. Doe)
+    - Return None if not found (caller may fallback to filename)
+    """
+    if not text:
+        return None
     lines = [l.strip() for l in text.splitlines() if l.strip()]
-    for l in lines[:5]:
-        if "@" not in l and len(l.split()) <= 4:
+
+    # pattern-based extraction
+    for l in lines[:12]:
+        m = re.search(r"(?:name|candidate|applicant)[:\-\s]+([A-Z][A-Za-z\.'`\- ]{1,80})", l, flags=re.I)
+        if m:
+            cand = m.group(1).strip()
+            # reject if contains email-like or too long
+            if '@' in cand or len(cand.split()) > 6:
+                continue
+            return cand
+
+    # first short line without email
+    for l in lines[:8]:
+        if "@" not in l and 1 <= len(l.split()) <= 4:
             return l
-    return "Unknown"
+
+    # search for capitalized name-like sequences in the first 50 chars
+    text_front = " ".join(lines[:6])
+    cap_match = re.search(r"([A-Z][a-z]+(?:\s+[A-Z][a-z\-\.]+){0,3})", text_front)
+    if cap_match:
+        return cap_match.group(1)
+
+    return None
 
 # ---------- Embeddings ----------
 
@@ -65,7 +93,10 @@ def create_docs_from_pdfs(files: List[Dict[str, Any]]) -> List[Document]:
     for f in files:
         text = extract_text_from_pdf_bytes(f["bytes"])
         text = preprocess_text(text)
-        name = guess_name(text)  # use original candidate name detection
+        name = guess_name(text)
+        if not name:
+            # fallback to file stem
+            name = os.path.splitext(f.get("name", "unknown"))[0]
         chunks = splitter.split_text(text)
         for i, chunk in enumerate(chunks):
             docs.append(Document(page_content=chunk, metadata={
@@ -130,7 +161,14 @@ def query_index(vs, embedder: LocalEmbeddings, query: str, top_k=5):
     D, I = vs["index"].search(np.array([q_emb]), top_k)
     results = []
     for score, i in zip(D[0], I[0]):
-        results.append({"text": vs["texts"][i], "metadata": vs["metadatas"][i], "score": float(score)})
+        # FAISS may return -1 or padded indices when fewer than top_k entries exist
+        if i is None or int(i) < 0:
+            continue
+        i = int(i)
+        if i >= len(vs.get("texts", [])):
+            # out-of-range index for the provided texts slice, skip
+            continue
+        results.append({"text": vs["texts"][i], "metadata": vs["metadatas"][i], "score": float(score), "idx": i})
     return results
 
 # ---------- Streamlit UI ----------
