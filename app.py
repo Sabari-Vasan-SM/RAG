@@ -7,6 +7,7 @@ import streamlit as st
 from PyPDF2 import PdfReader
 import faiss
 import numpy as np
+from math import log
 
 from langchain.text_splitter import CharacterTextSplitter
 from langchain.docstore.document import Document
@@ -97,7 +98,23 @@ def build_index(docs: List[Document], embedder: LocalEmbeddings):
     index.add(embeddings)
 
     # store embeddings array so we can slice/filter without relying on index.reconstruct
-    vs = {"index": index, "texts": texts, "metadatas": metadatas, "dim": dim, "embeddings": embeddings}
+    # compute simple token-based document frequency (for IDF keyword weighting)
+    def _tokenize(t: str):
+        return set(re.findall(r"\w+", t.lower()))
+
+    N = len(texts)
+    df = {}
+    doc_tokens = []
+    for t in texts:
+        toks = _tokenize(t)
+        doc_tokens.append(toks)
+        for tok in toks:
+            df[tok] = df.get(tok, 0) + 1
+
+    # smooth idf
+    idf = {tok: log((1 + N) / (1 + cnt)) + 1.0 for tok, cnt in df.items()}
+
+    vs = {"index": index, "texts": texts, "metadatas": metadatas, "dim": dim, "embeddings": embeddings, "idf": idf, "doc_tokens": doc_tokens}
     return vs
 
 def query_index(vs, embedder: LocalEmbeddings, query: str, top_k=5):
@@ -156,6 +173,7 @@ st.markdown("## 2️⃣ Search resumes")
 query = st.text_input("Enter query (e.g., React, AWS, John)")
 candidate_hint = st.text_input("Optional: Candidate name filter")
 top_k = st.number_input("Top-k chunks to retrieve", min_value=1, max_value=10, value=5)
+use_reranker = st.checkbox("Use Cross-Encoder reranker for top results (slower)", value=False)
 
 if st.button("Search"):
     if not st.session_state.vs:
@@ -174,18 +192,26 @@ if st.button("Search"):
             filtered_indices = [i for i, md in enumerate(vs["metadatas"]) 
                                 if candidate_hint.lower() in md.get("candidate_name", "").lower()]
 
-        # Keyword filtering: mark chunks containing keywords and compute a candidate set
+        # Keyword filtering and IDF-weighted match scoring
         keyword_filtered_indices = []
         keyword_match_scores = {}
+        # tokenize query and compute IDF-weighted relevance
+        query_tokens = re.findall(r"\w+", query.lower())
+        q_idf_sum = 0.0
+        for t in query_tokens:
+            q_idf_sum += vs.get("idf", {}).get(t, 1.0)
+        q_idf_sum = max(q_idf_sum, 1.0)
+
         for i in filtered_indices:
-            text = vs["texts"][i]
-            text_lower = text.lower()
-            matches = sum(1 for kw in keywords if kw in text_lower)
-            # fraction of keywords present
-            frac = matches / max(1, len(keywords))
-            if matches > 0:
+            toks = vs.get("doc_tokens")[i]
+            matched_idf = 0.0
+            for qt in query_tokens:
+                if qt in toks:
+                    matched_idf += vs.get("idf", {}).get(qt, 1.0)
+            if matched_idf > 0:
                 keyword_filtered_indices.append(i)
-            keyword_match_scores[i] = frac
+            # normalized IDF fraction
+            keyword_match_scores[i] = matched_idf / q_idf_sum
 
         if not keyword_filtered_indices:
             st.info("No candidate or chunk contains the keyword. Searching all filtered chunks as fallback.")
@@ -213,24 +239,50 @@ if st.button("Search"):
 
         raw_results = query_index(temp_vs, embedder, query, top_k=top_k)
 
-        # Combine embedding score (raw_results 'score' is inner-product because we used IndexFlatIP)
-        # with keyword match fraction to create a hybrid score. Weight can be tuned.
+        # Combine embedding score (inner-product) and IDF-weighted keyword fraction.
+        # Inner-product with normalized vectors is in [-1,1]; map to [0,1].
+        def _norm_emb(s):
+            return max(0.0, min(1.0, (s + 1.0) / 2.0))
+
         hybrid_results = []
         for r in raw_results:
-            # locate original index
-            # find position in temp_vs texts list
             try:
                 pos = temp_vs["texts"].index(r["text"])
             except ValueError:
                 pos = None
-            emb_score = r.get("score", 0.0)
+            emb_score_raw = r.get("score", 0.0)
+            emb_score = _norm_emb(emb_score_raw)
             orig_idx = temp_vs.get("orig_indices")[pos] if pos is not None else None
             kw_frac = temp_vs.get("keyword_match_scores", {}).get(orig_idx, 0.0)
-            hybrid = 0.75 * emb_score + 0.25 * kw_frac
+            hybrid = 0.7 * emb_score + 0.3 * kw_frac
             hybrid_results.append({"text": r["text"], "metadata": r["metadata"], "emb_score": emb_score, "kw_frac": kw_frac, "hybrid": hybrid})
 
         # sort by hybrid score descending
         hybrid_results.sort(key=lambda x: x["hybrid"], reverse=True)
+
+        # Optional Cross-Encoder reranker for top results
+        if use_reranker and len(hybrid_results) > 0:
+            try:
+                from sentence_transformers import CrossEncoder
+                rerank_model = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
+                # build pairs: (query, text)
+                pairs = [(query, r['text']) for r in hybrid_results]
+                rerank_scores = rerank_model.predict(pairs)
+                for r, s in zip(hybrid_results, rerank_scores):
+                    # combine reranker score (assumed larger = better) with hybrid
+                    # normalize reranker using min-max across scores
+                    r['rerank_raw'] = float(s)
+                # normalize reranker scores to [0,1]
+                vals = [r.get('rerank_raw', 0.0) for r in hybrid_results]
+                vmin, vmax = min(vals), max(vals)
+                span = max(1e-6, vmax - vmin)
+                for r in hybrid_results:
+                    r['rerank'] = (r.get('rerank_raw', 0.0) - vmin) / span
+                    # final combination: give reranker strong influence
+                    r['final_score'] = 0.5 * r['hybrid'] + 0.5 * r['rerank']
+                hybrid_results.sort(key=lambda x: x.get('final_score', x['hybrid']), reverse=True)
+            except Exception as e:
+                st.warning(f"Reranker failed to load or run: {e}")
 
         results = hybrid_results
 
